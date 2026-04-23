@@ -1,0 +1,40 @@
+{
+    "oracle": {
+        "host": "localhost",
+        "port": 1521,
+        "service_name": "ORCL",
+        "sid": "",
+        "username": "scott",
+        "password": "tiger",
+        "schema": "SCOTT"
+    },
+    "mssql": {
+        "host": "localhost",
+        "port": 1433,
+        "database": "TargetDB",
+        "username": "sa",
+        "password": "YourPassword"
+    },
+    "conversion": {
+        "include_tables": true,
+        "include_views": true,
+        "include_sequences": true,
+        "include_procedures": true,
+        "include_functions": true,
+        "include_triggers": true,
+        "include_indexes": true,
+        "remove_schema_prefix": true,
+        "target_schema": "dbo",
+        "output_directory": "./output",
+        "single_file": false,
+        "file_encoding": "utf-8",
+        "convert_nvarchar": true,
+        "convert_number_to_decimal": true,
+        "convert_clob_to_ntext": true,
+        "convert_blob_to_varbinary": true,
+        "handle_auto_increment": true,
+        "convert_sysdate_to_getdate": true,
+        "convert_dual_table": true,
+        "type_mappings": {}
+    }
+}
