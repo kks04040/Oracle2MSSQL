@@ -279,10 +279,11 @@ class TableConverter:
                 lines.append(fk_lines)
         
         # Add indexes
-        for idx in table.indexes:
-            if not self._is_constraint_index(idx, table.constraints):
-                idx_lines = self._convert_index(idx)
-                lines.append(idx_lines)
+        if self.config.include_indexes:
+            for idx in table.indexes:
+                if not self._is_constraint_index(idx, table.constraints):
+                    idx_lines = self._convert_index(idx)
+                    lines.append(idx_lines)
         
         # Add column comments as extended properties
         for col in table.columns:
@@ -504,10 +505,19 @@ class ViewConverter:
 
     def _convert_rownum(self, sql: str) -> str:
         """Convert ROWNUM usage to MSSQL equivalent."""
-        # Simple ROWNUM = 1 to TOP 1
-        sql = re.sub(r'(?i)WHERE\s+ROWNUM\s*=\s*1', '', sql)
-        sql = re.sub(r'(?i)AND\s+ROWNUM\s*=\s*1', '', sql)
-        sql = re.sub(r'(?i)SELECT\s+', 'SELECT TOP 1 ', sql, count=1)
+        rownum_match = re.search(r'(?i)\bROWNUM\s*(?:=|<=|<)\s*(\d+)', sql)
+        if not rownum_match:
+            return sql
+
+        limit = int(rownum_match.group(1))
+        if re.search(r'(?i)\bROWNUM\s*<\s*\d+', rownum_match.group(0)):
+            limit = max(limit - 1, 0)
+
+        rownum_condition = r'ROWNUM\s*(?:=|<=|<)\s*\d+'
+        sql = re.sub(rf'(?i)\s+WHERE\s+{rownum_condition}\s+AND\s+', ' WHERE ', sql, count=1)
+        sql = re.sub(rf'(?i)\s+AND\s+{rownum_condition}\b', '', sql, count=1)
+        sql = re.sub(rf'(?i)\s+WHERE\s+{rownum_condition}\b', '', sql, count=1)
+        sql = re.sub(r'(?i)\bSELECT\s+', f'SELECT TOP {limit} ', sql, count=1)
         return sql
 
     def _convert_dual(self, sql: str) -> str:
@@ -830,8 +840,11 @@ class DDLConverter:
             for seq in sequences:
                 result['sequences'].append(self.sequence_converter.convert(seq))
         
-        if self.config.include_procedures:
-            for proc in extracted_data.get('procedures', []):
+        for proc in extracted_data.get('procedures', []):
+            proc_type = proc.type.upper()
+            if proc_type == 'PROCEDURE' and self.config.include_procedures:
+                result['procedures'].append(self.procedure_converter.convert(proc))
+            elif proc_type == 'FUNCTION' and self.config.include_functions:
                 result['procedures'].append(self.procedure_converter.convert(proc))
         
         if self.config.include_triggers:

@@ -31,7 +31,7 @@ Examples:
     # Connection options
     conn_group = parser.add_argument_group('Oracle Connection')
     conn_group.add_argument('--host', help='Oracle database host')
-    conn_group.add_argument('--port', type=int, default=1521, help='Oracle database port (default: 1521)')
+    conn_group.add_argument('--port', type=int, help='Oracle database port (default: 1521)')
     conn_group.add_argument('--service-name', help='Oracle service name')
     conn_group.add_argument('--sid', help='Oracle SID')
     conn_group.add_argument('--user', help='Oracle username')
@@ -43,19 +43,19 @@ Examples:
     
     # Output options
     output_group = parser.add_argument_group('Output Options')
-    output_group.add_argument('--output', '-o', default='./output', help='Output directory (default: ./output)')
-    output_group.add_argument('--single-file', action='store_true', help='Generate single migration script')
-    output_group.add_argument('--target-schema', default='dbo', help='Target MSSQL schema (default: dbo)')
+    output_group.add_argument('--output', '-o', help='Output directory (default: ./output)')
+    output_group.add_argument('--single-file', action='store_true', default=None, help='Generate single migration script')
+    output_group.add_argument('--target-schema', help='Target MSSQL schema (default: dbo)')
     
     # Object type filters
     filter_group = parser.add_argument_group('Object Type Filters')
-    filter_group.add_argument('--include-tables', action='store_true', default=True, help='Include tables (default)')
-    filter_group.add_argument('--include-views', action='store_true', default=True, help='Include views (default)')
-    filter_group.add_argument('--include-sequences', action='store_true', default=True, help='Include sequences (default)')
-    filter_group.add_argument('--include-procedures', action='store_true', default=True, help='Include procedures (default)')
-    filter_group.add_argument('--include-functions', action='store_true', default=True, help='Include functions (default)')
-    filter_group.add_argument('--include-triggers', action='store_true', default=True, help='Include triggers (default)')
-    filter_group.add_argument('--include-indexes', action='store_true', default=True, help='Include indexes (default)')
+    filter_group.add_argument('--include-tables', action='store_true', default=None, help='Include tables')
+    filter_group.add_argument('--include-views', action='store_true', default=None, help='Include views')
+    filter_group.add_argument('--include-sequences', action='store_true', default=None, help='Include sequences')
+    filter_group.add_argument('--include-procedures', action='store_true', default=None, help='Include procedures')
+    filter_group.add_argument('--include-functions', action='store_true', default=None, help='Include functions')
+    filter_group.add_argument('--include-triggers', action='store_true', default=None, help='Include triggers')
+    filter_group.add_argument('--include-indexes', action='store_true', default=None, help='Include indexes')
     
     filter_group.add_argument('--exclude-tables', action='store_false', dest='include_tables', help='Exclude tables')
     filter_group.add_argument('--exclude-views', action='store_false', dest='include_views', help='Exclude views')
@@ -67,8 +67,9 @@ Examples:
     
     # Conversion options
     conv_group = parser.add_argument_group('Conversion Options')
-    conv_group.add_argument('--no-auto-increment', action='store_true', help='Disable auto-increment conversion')
-    conv_group.add_argument('--remove-schema-prefix', action='store_true', default=True, help='Remove Oracle schema prefix')
+    conv_group.add_argument('--no-auto-increment', action='store_true', default=None, help='Disable auto-increment conversion')
+    conv_group.add_argument('--remove-schema-prefix', action='store_true', default=None, help='Remove Oracle schema prefix')
+    conv_group.add_argument('--keep-schema-prefix', action='store_false', dest='remove_schema_prefix', help='Keep Oracle schema prefix')
     conv_group.add_argument('--type-mappings', help='Custom type mappings JSON string')
     
     return parser.parse_args()
@@ -88,7 +89,7 @@ def load_config(args) -> Config:
     # Override with command line arguments
     if args.host:
         config.oracle.host = args.host
-    if args.port:
+    if args.port is not None:
         config.oracle.port = args.port
     if args.service_name:
         config.oracle.service_name = args.service_name
@@ -101,18 +102,27 @@ def load_config(args) -> Config:
     if args.schema:
         config.oracle.schema = args.schema
     
-    config.conversion.output_directory = args.output
-    config.conversion.single_file = args.single_file
-    config.conversion.target_schema = args.target_schema
-    
-    config.conversion.include_tables = args.include_tables
-    config.conversion.include_views = args.include_views
-    config.conversion.include_sequences = args.include_sequences
-    config.conversion.include_procedures = args.include_procedures
-    config.conversion.include_functions = args.include_functions
-    config.conversion.include_triggers = args.include_triggers
-    config.conversion.include_indexes = args.include_indexes
-    
+    if args.output:
+        config.conversion.output_directory = args.output
+    if args.single_file is not None:
+        config.conversion.single_file = args.single_file
+    if args.target_schema:
+        config.conversion.target_schema = args.target_schema
+
+    for option in (
+        'include_tables',
+        'include_views',
+        'include_sequences',
+        'include_procedures',
+        'include_functions',
+        'include_triggers',
+        'include_indexes',
+        'remove_schema_prefix',
+    ):
+        value = getattr(args, option)
+        if value is not None:
+            setattr(config.conversion, option, value)
+
     if args.no_auto_increment:
         config.conversion.handle_auto_increment = False
     
@@ -131,9 +141,6 @@ def save_output(converted: dict, config: Config):
     
     if config.conversion.single_file:
         # Generate single migration script
-        converter = DDLConverter(config.conversion)
-        
-        # We need to regenerate from the extracted data
         full_script = converted.get('_full_script', '')
         
         output_file = os.path.join(output_dir, f'migration_{timestamp}.sql')
