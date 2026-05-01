@@ -174,7 +174,7 @@ class OracleExtractor:
             # Get constraints
             cursor.execute("""
                 SELECT constraint_name, constraint_type, search_condition, 
-                       delete_rule, r_constraint_name
+                       delete_rule, r_constraint_name, r_owner
                 FROM all_constraints
                 WHERE owner = :schema AND table_name = :table
                 AND constraint_type IN ('P', 'U', 'R', 'C')
@@ -187,7 +187,8 @@ class OracleExtractor:
                     'type': row[1],
                     'search_condition': row[2],
                     'delete_rule': row[3],
-                    'r_constraint_name': row[4]
+                    'r_constraint_name': row[4],
+                    'r_owner': row[5]
                 })
 
             # Get constraint columns
@@ -205,14 +206,15 @@ class OracleExtractor:
                 ref_table = None
                 ref_cols = []
                 if ci['type'] == 'R' and ci['r_constraint_name']:
+                    ref_owner = ci.get('r_owner') or schema
                     cursor.execute("""
                         SELECT r.table_name, cc.column_name
                         FROM all_constraints r
                         JOIN all_cons_columns cc ON r.constraint_name = cc.constraint_name 
                             AND r.owner = cc.owner
-                        WHERE r.owner = :schema AND r.constraint_name = :ref_constraint
+                        WHERE r.owner = :ref_owner AND r.constraint_name = :ref_constraint
                         ORDER BY cc.position
-                    """, schema=schema, ref_constraint=ci['r_constraint_name'])
+                    """, ref_owner=ref_owner, ref_constraint=ci['r_constraint_name'])
                     
                     ref_rows = cursor.fetchall()
                     if ref_rows:
@@ -374,13 +376,13 @@ class OracleExtractor:
 
             args = []
             for row in cursor.fetchall():
-                if row[0]:  # Skip return value
-                    args.append({
-                        'name': row[0],
-                        'data_type': row[1],
-                        'in_out': row[2],
-                        'position': row[3]
-                    })
+                arg_name = row[0] if row[0] else 'RETURN'
+                args.append({
+                    'name': arg_name,
+                    'data_type': row[1],
+                    'in_out': row[2],
+                    'position': row[3]
+                })
 
             proc = ProcedureDef(
                 name=obj_name,

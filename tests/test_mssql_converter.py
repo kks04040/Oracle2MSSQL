@@ -12,8 +12,8 @@ sys.modules.setdefault("oracledb", types.SimpleNamespace())
 
 from config import ConversionConfig
 from main import load_config
-from mssql_converter import DDLConverter, TableConverter, ViewConverter
-from oracle_extractor import ColumnDef, IndexDef, ProcedureDef, TableDef
+from mssql_converter import DDLConverter, ProcedureConverter, TableConverter, ViewConverter
+from oracle_extractor import ColumnDef, ConstraintDef, IndexDef, ProcedureDef, TableDef
 
 
 class ViewConverterTests(unittest.TestCase):
@@ -40,6 +40,17 @@ class ViewConverterTests(unittest.TestCase):
 
         self.assertEqual(sql, "SELECT TOP 1 ID FROM USERS WHERE ACTIVE = 1")
 
+    def test_schema_prefix_removal_keeps_alias_column_references(self):
+        converter = ViewConverter(ConversionConfig(remove_schema_prefix=True))
+
+        sql = converter._convert_view_body(
+            "SELECT T.ID FROM APP.USERS T JOIN APP.ORDERS O ON O.USER_ID = T.ID"
+        )
+
+        self.assertIn("FROM USERS T", sql)
+        self.assertIn("JOIN ORDERS O", sql)
+        self.assertIn("O.USER_ID = T.ID", sql)
+
 
 class TableConverterTests(unittest.TestCase):
     """Tests for table conversion options."""
@@ -55,6 +66,23 @@ class TableConverterTests(unittest.TestCase):
         ddl = TableConverter(config).convert(table)
 
         self.assertNotIn("CREATE INDEX", ddl)
+
+    def test_composite_primary_key_does_not_create_multiple_identity_columns(self):
+        config = ConversionConfig(handle_auto_increment=True)
+        table = TableDef(
+            name="ORDER_ITEM",
+            columns=[
+                ColumnDef(name="ORDER_ID", data_type="NUMBER", data_precision=10, nullable=False),
+                ColumnDef(name="ITEM_ID", data_type="NUMBER", data_precision=10, nullable=False),
+            ],
+            constraints=[
+                ConstraintDef(name="PK_ORDER_ITEM", type="P", columns=["ORDER_ID", "ITEM_ID"]),
+            ],
+        )
+
+        ddl = TableConverter(config).convert(table)
+
+        self.assertEqual(ddl.count("IDENTITY(1,1)"), 0)
 
 
 class DDLConverterTests(unittest.TestCase):
@@ -74,6 +102,26 @@ class DDLConverterTests(unittest.TestCase):
 
         self.assertNotIn("DO_WORK", ddl)
         self.assertIn("GET_VALUE", ddl)
+
+
+class ProcedureConverterTests(unittest.TestCase):
+    """Tests for procedure/function conversion details."""
+
+    def test_function_returns_clause_uses_return_argument_type(self):
+        converter = ProcedureConverter(ConversionConfig())
+        proc = ProcedureDef(
+            name="GET_VALUE",
+            type="FUNCTION",
+            source="CREATE OR REPLACE FUNCTION GET_VALUE(P_ID NUMBER) RETURN NUMBER AS BEGIN RETURN 1; END;",
+            arguments=[
+                {"name": "RETURN", "data_type": "NUMBER", "in_out": "OUT", "position": 0},
+                {"name": "P_ID", "data_type": "NUMBER", "in_out": "IN", "position": 1},
+            ],
+        )
+
+        ddl = converter.convert(proc)
+
+        self.assertIn("RETURNS DECIMAL(18,2)", ddl)
 
 
 class ConfigLoadingTests(unittest.TestCase):

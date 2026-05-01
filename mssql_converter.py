@@ -229,13 +229,7 @@ class TableConverter:
         unique_constraints = []
         check_constraints = []
         foreign_keys = []
-        identity_col = None
-        
-        # Process columns
-        for col in table.columns:
-            col_lines = self._convert_column(col, table.constraints)
-            column_lines.append(f"    {col_lines}")
-        
+
         # Process constraints
         for constraint in table.constraints:
             if constraint.type == 'P':
@@ -246,6 +240,15 @@ class TableConverter:
                 check_constraints.append(constraint)
             elif constraint.type == 'R':
                 foreign_keys.append(constraint)
+
+        identity_column = None
+        if self.config.handle_auto_increment and len(primary_key_cols) == 1:
+            identity_column = primary_key_cols[0]
+
+        # Process columns
+        for col in table.columns:
+            col_lines = self._convert_column(col, table.constraints, identity_column)
+            column_lines.append(f"    {col_lines}")
         
         # Build the statement
         all_parts = column_lines[:]
@@ -297,13 +300,17 @@ class TableConverter:
         
         return '\n'.join(lines)
 
-    def _convert_column(self, col: ColumnDef, constraints: List[ConstraintDef]) -> str:
+    def _convert_column(
+        self,
+        col: ColumnDef,
+        constraints: List[ConstraintDef],
+        identity_column: Optional[str]
+    ) -> str:
         """Convert a single column definition."""
         parts = [quote_identifier(col.name)]
         
         # Determine if this is part of a primary key with sequence
         is_pk = False
-        pk_sequence = None
         for c in constraints:
             if c.type == 'P' and col.name in c.columns:
                 is_pk = True
@@ -318,7 +325,7 @@ class TableConverter:
         parts.append(mssql_type)
         
         # Identity for auto-increment primary keys
-        if is_pk and self.config.handle_auto_increment:
+        if identity_column and col.name == identity_column:
             parts.append("IDENTITY(1,1)")
         
         # Default value
@@ -497,10 +504,24 @@ class ViewConverter:
             sql = re.sub(r'(?i)(\w+)\.CURRVAL',
                          r'/* MANUAL: Replace \1.CURRVAL - use SCOPE_IDENTITY() or a variable */', sql)
 
-        # Remove schema prefixes
+        # Remove schema prefixes on object references while preserving alias-qualified columns.
         if self.config.remove_schema_prefix:
-            sql = re.sub(r'\b[A-Z_]+\.\b', '', sql)
+            sql = self._remove_object_schema_prefixes(sql)
 
+        return sql
+
+    def _remove_object_schema_prefixes(self, sql: str) -> str:
+        """Remove owner prefixes from table/view references without touching alias.column patterns."""
+        sql = re.sub(
+            r'(?i)\b(FROM|JOIN|UPDATE|INTO|DELETE\s+FROM|MERGE\s+INTO)\s+([A-Z_][A-Z0-9_$#]*)\.([A-Z_][A-Z0-9_$#]*)',
+            r'\1 \3',
+            sql
+        )
+        sql = re.sub(
+            r'(?i)(,\s*)([A-Z_][A-Z0-9_$#]*)\.([A-Z_][A-Z0-9_$#]*)',
+            r'\1\3',
+            sql
+        )
         return sql
 
     def _convert_rownum(self, sql: str) -> str:
@@ -715,16 +736,24 @@ class ProcedureConverter:
         # Find function definition line
         func_match = re.search(r'(?i)(CREATE\s+FUNCTION\s+\w+\s*)\(', source)
         if func_match:
-            # Check for RETURN type in arguments
+            # Check for explicit RETURN type in extracted arguments.
+            return_arg = None
             for arg in args:
-                if arg.get('in_out') == 'OUT' or arg.get('name', '').upper() == 'RETURN':
-                    return_type = convert_data_type(arg['data_type'])
-                    source = re.sub(
-                        r'(?i)(CREATE\s+FUNCTION\s+\w+\s*\([^)]*\))',
-                        rf'\1 RETURNS {return_type}',
-                        source
-                    )
+                if arg.get('name', '').upper() == 'RETURN':
+                    return_arg = arg
                     break
+            if return_arg is None:
+                for arg in args:
+                    if arg.get('in_out') == 'OUT':
+                        return_arg = arg
+                        break
+            if return_arg and return_arg.get('data_type'):
+                return_type = convert_data_type(return_arg['data_type'])
+                source = re.sub(
+                    r'(?i)(CREATE\s+FUNCTION\s+\w+\s*\([^)]*\))',
+                    rf'\1 RETURNS {return_type}',
+                    source
+                )
         
         return source
 
