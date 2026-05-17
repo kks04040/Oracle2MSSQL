@@ -12,6 +12,7 @@ from datetime import datetime
 from config import Config, OracleConfig, ConversionConfig
 from oracle_extractor import OracleExtractor
 from mssql_converter import DDLConverter
+from mssql_executor import MSSQLExecutor, ExecutionResult
 
 
 def parse_args():
@@ -40,6 +41,29 @@ Examples:
     
     # Configuration file
     parser.add_argument('--config', help='Path to JSON configuration file')
+
+    # MSSQL connection options
+    mssql_group = parser.add_argument_group('MSSQL Connection (for --execute)')
+    mssql_group.add_argument('--mssql-host', help='MSSQL server host')
+    mssql_group.add_argument('--mssql-port', type=int, help='MSSQL server port (default: 1433)')
+    mssql_group.add_argument('--mssql-database', help='MSSQL target database name')
+    mssql_group.add_argument('--mssql-user', help='MSSQL username')
+    mssql_group.add_argument('--mssql-password', help='MSSQL password')
+
+    # Execute options
+    exec_group = parser.add_argument_group('Execution Options')
+    exec_group.add_argument(
+        '--execute', action='store_true',
+        help='Execute converted DDL directly on MSSQL after generation',
+    )
+    exec_group.add_argument(
+        '--dry-run', action='store_true',
+        help='Parse DDL statements without executing (use with --execute)',
+    )
+    exec_group.add_argument(
+        '--stop-on-error', action='store_true',
+        help='Stop execution on first error (default: continue)',
+    )
     
     # Output options
     output_group = parser.add_argument_group('Output Options')
@@ -108,6 +132,18 @@ def load_config(args) -> Config:
         config.conversion.single_file = args.single_file
     if args.target_schema:
         config.conversion.target_schema = args.target_schema
+
+    # MSSQL connection overrides
+    if getattr(args, 'mssql_host', None):
+        config.mssql.host = args.mssql_host
+    if getattr(args, 'mssql_port', None) is not None:
+        config.mssql.port = args.mssql_port
+    if getattr(args, 'mssql_database', None):
+        config.mssql.database = args.mssql_database
+    if getattr(args, 'mssql_user', None):
+        config.mssql.username = args.mssql_user
+    if getattr(args, 'mssql_password', None):
+        config.mssql.password = args.mssql_password
 
     for option in (
         'include_tables',
@@ -192,14 +228,14 @@ def print_summary(extracted: dict, converted: dict):
     print("\n" + "=" * 60)
     print("Oracle to MSSQL Migration Summary")
     print("=" * 60)
-    
+
     print("\nExtracted Objects:")
     print(f"  Tables:     {len(extracted.get('tables', []))}")
     print(f"  Views:      {len(extracted.get('views', []))}")
     print(f"  Sequences:  {len(extracted.get('sequences', []))}")
     print(f"  Procedures: {len(extracted.get('procedures', []))}")
     print(f"  Triggers:   {len(extracted.get('triggers', []))}")
-    
+
     total_extracted = (
         len(extracted.get('tables', [])) +
         len(extracted.get('views', [])) +
@@ -207,7 +243,7 @@ def print_summary(extracted: dict, converted: dict):
         len(extracted.get('procedures', [])) +
         len(extracted.get('triggers', []))
     )
-    
+
     total_converted = (
         len(converted.get('tables', [])) +
         len(converted.get('views', [])) +
@@ -215,15 +251,104 @@ def print_summary(extracted: dict, converted: dict):
         len(converted.get('procedures', [])) +
         len(converted.get('triggers', []))
     )
-    
+
     print(f"\nTotal extracted: {total_extracted}")
     print(f"Total converted: {total_converted}")
-    
+
     if total_extracted > 0:
         compatibility = (total_converted / total_extracted) * 100
         print(f"Compatibility:   {compatibility:.1f}%")
-    
+
     print("=" * 60)
+
+
+def execute_on_mssql(config: Config, converted: dict, args) -> None:
+    """Execute converted DDL on MSSQL database.
+
+    Args:
+        config: Full configuration including MSSQL connection details.
+        converted: Dictionary of converted DDL strings by object type.
+        args: Parsed command-line arguments.
+    """
+    mssql = config.mssql
+
+    # Validate MSSQL connection
+    if not mssql.host:
+        print("Error: --mssql-host is required when using --execute")
+        sys.exit(1)
+    if not mssql.database:
+        print("Error: --mssql-database is required when using --execute")
+        sys.exit(1)
+    if not mssql.username:
+        print("Error: --mssql-user is required when using --execute")
+        sys.exit(1)
+    if mssql.password is None:
+        print("Error: --mssql-password is required when using --execute")
+        sys.exit(1)
+
+    mode_label = " (DRY RUN)" if args.dry_run else ""
+    print(f"\n{'=' * 60}")
+    print(f"Executing DDL on MSSQL: {mssql.host}:{mssql.port}/{mssql.database}{mode_label}")
+    print(f"{'=' * 60}")
+
+    executor = MSSQLExecutor(mssql)
+
+    try:
+        if config.conversion.single_file:
+            script = converted.get('_full_script', '')
+            if script:
+                result = executor.execute_script(script, dry_run=args.dry_run)
+                _print_execution_result(result)
+        else:
+            # Execute in order: sequences -> tables -> views -> procedures -> triggers
+            ordered = [
+                ('Sequences', converted.get('sequences', [])),
+                ('Tables', converted.get('tables', [])),
+                ('Views', converted.get('views', [])),
+                ('Procedures', converted.get('procedures', [])),
+                ('Triggers', converted.get('triggers', [])),
+            ]
+            total_result = ExecutionResult()
+            for label, items in ordered:
+                if not items:
+                    continue
+                print(f"\n--- {label} ---")
+                script = '\n'.join(items)
+                result = executor.execute_script(script, dry_run=args.dry_run)
+                total_result.total_statements += result.total_statements
+                total_result.succeeded += result.succeeded
+                total_result.failed += result.failed
+                total_result.skipped += result.skipped
+                total_result.errors.extend(result.errors)
+                _print_execution_result(result)
+
+                if args.stop_on_error and result.failed > 0:
+                    print("\nStopped due to --stop-on-error flag")
+                    break
+
+            if total_result.total_statements > 0:
+                print(f"\n{'=' * 60}")
+                print(f"Overall Result:")
+                _print_execution_result(total_result)
+
+    finally:
+        executor.close()
+
+
+def _print_execution_result(result) -> None:
+    """Print formatted execution result."""
+    print(f"  Statements: {result.total_statements}")
+    print(f"  Succeeded:  {result.succeeded}")
+    print(f"  Failed:     {result.failed}")
+    print(f"  Skipped:    {result.skipped}")
+    print(f"  Success:    {result.success_rate:.1f}%")
+
+    if result.errors:
+        print(f"\n  Errors ({len(result.errors)}):")
+        for err in result.errors[:10]:  # Show first 10 errors
+            print(f"    [{err['index']}] {err['type']}: {err['error'][:120]}")
+        if len(result.errors) > 10:
+            print(f"    ... and {len(result.errors) - 10} more")
 
 
 def main():
@@ -272,12 +397,16 @@ def main():
         
         # Print summary
         print_summary(extracted, converted)
-        
+
         # Save output
         save_output(converted, config)
-        
+
         print("\nMigration script generation complete!")
-        
+
+        # Execute on MSSQL if requested
+        if args.execute:
+            execute_on_mssql(config, converted, args)
+
         # Print warnings for manual review items
         print("\n" + "-" * 60)
         print("Manual Review Recommendations:")

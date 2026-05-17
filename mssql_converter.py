@@ -58,6 +58,394 @@ def _is_score_column(column_name: str) -> bool:
     return any(keyword in upper_name for keyword in _SCORE_KEYWORDS)
 
 
+# ---------------------------------------------------------------------------
+# Shared Oracle function -> MSSQL conversion utilities
+# Used by ViewConverter, ProcedureConverter, and TriggerConverter
+# ---------------------------------------------------------------------------
+
+def _convert_decode(sql: str) -> str:
+    """Convert Oracle DECODE(expr, search1, result1, ..., default) to CASE WHEN.
+
+    DECODE(a, 1, 'X', 2, 'Y', 'Z')
+      -> CASE WHEN a=1 THEN 'X' WHEN a=2 THEN 'Y' ELSE 'Z' END
+
+    DECODE(a, 1, 'X')
+      -> CASE WHEN a=1 THEN 'X' ELSE NULL END
+    """
+    def _replace_decode(match: re.Match) -> str:
+        full = match.group(0)
+        inner = match.group(1)
+        args = _split_function_args(inner)
+        if len(args) < 3:
+            return full  # Not enough args, leave as-is
+
+        expr = args[0].strip()
+        pairs = args[1:]
+        case_parts = []
+        i = 0
+        while i < len(pairs) - 1:
+            search_val = pairs[i].strip()
+            result_val = pairs[i + 1].strip()
+            case_parts.append(f"WHEN {expr}={search_val} THEN {result_val}")
+            i += 2
+        else_val = "NULL"
+        if i < len(pairs):
+            else_val = pairs[i].strip()
+        case_body = " ".join(case_parts)
+        return f"CASE {case_body} ELSE {else_val} END"
+
+    return re.sub(r'(?i)\bDECODE\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)', _replace_decode, sql)
+
+
+def _split_function_args(text: str) -> List[str]:
+    """Split function arguments respecting nested parentheses and quoted strings."""
+    args = []
+    current = []
+    depth = 0
+    in_quote = None
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if in_quote:
+            current.append(ch)
+            if ch == in_quote and i + 1 < len(text) and text[i + 1] == in_quote:
+                current.append(text[i + 1])
+                i += 1
+            elif ch == in_quote:
+                in_quote = None
+        elif ch in ("'", '"'):
+            in_quote = ch
+            current.append(ch)
+        elif ch == '(':
+            depth += 1
+            current.append(ch)
+        elif ch == ')':
+            depth -= 1
+            current.append(ch)
+        elif ch == ',' and depth == 0:
+            args.append(''.join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+        i += 1
+    if current:
+        args.append(''.join(current).strip())
+    return args
+
+
+def _convert_date_functions(sql: str) -> str:
+    """Convert Oracle date functions to MSSQL equivalents."""
+    # ADD_MONTHS(date, n) -> DATEADD(month, n, date)
+    sql = re.sub(
+        r'(?i)\bADD_MONTHS\s*\(\s*([^,]+?)\s*,\s*([^)]+)\s*\)',
+        r'DATEADD(month, \2, \1)',
+        sql,
+    )
+
+    # MONTHS_BETWEEN(d1, d2) -> DATEDIFF(month, d2, d1)
+    # Note: Oracle returns fractional months; MSSQL DATEDIFF returns integer
+    sql = re.sub(
+        r'(?i)\bMONTHS_BETWEEN\s*\(\s*([^,]+?)\s*,\s*([^)]+)\s*\)',
+        r'DATEDIFF(month, \2, \1)',
+        sql,
+    )
+
+    # LAST_DAY(date) -> EOMONTH(date)
+    sql = re.sub(
+        r'(?i)\bLAST_DAY\s*\(\s*([^)]+)\s*\)',
+        r'EOMONTH(\1)',
+        sql,
+    )
+
+    # NEXT_DAY(date, 'DAY') -> DATEADD(day, (target_dow - current_dow + 7) % 7, CAST(date AS DATE))
+    # Simplified: use a helper approach — just mark for manual review
+    def _replace_next_day(m: re.Match) -> str:
+        date_arg = m.group(1).strip()
+        day_arg = m.group(2).strip()
+        return f"/* NEXT_DAY conversion: manually replace with DATEADD logic for {day_arg} after {date_arg} */"
+
+    sql = re.sub(r'(?i)\bNEXT_DAY\s*\(\s*([^,]+?)\s*,\s*([^)]+)\s*\)', _replace_next_day, sql)
+
+    # TRUNC(date) -> CAST(... AS DATE)
+    # TRUNC(date, 'YYYY') -> DATEFROM-parts equivalent
+    # TRUNC(date, 'MM') -> first of month
+    # TRUNC(number, n) -> ROUND with manual consideration
+    sql = re.sub(
+        r"(?i)\bTRUNC\s*\(\s*([^,]+?)\s*,\s*'YYYY'\s*\)",
+        r"DATEFROMPARTS(YEAR(\1), 1, 1)",
+        sql,
+    )
+    sql = re.sub(
+        r"(?i)\bTRUNC\s*\(\s*([^,]+?)\s*,\s*'MM'\s*\)",
+        r"DATEFROMPARTS(YEAR(\1), MONTH(\1), 1)",
+        sql,
+    )
+    sql = re.sub(
+        r"(?i)\bTRUNC\s*\(\s*([^,]+?)\s*,\s*'Q'\s*\)",
+        r"DATEFROMPARTS(YEAR(\1), ((MONTH(\1)-1)/3)*3+1, 1)",
+        sql,
+    )
+    sql = re.sub(
+        r"(?i)\bTRUNC\s*\(\s*([^,]+?)\s*,\s*'DD'\s*\)",
+        r"CAST(\1 AS DATE)",
+        sql,
+    )
+    # TRUNC with single arg (date or number) — default truncates to day
+    sql = re.sub(
+        r'(?i)\bTRUNC\s*\(\s*([^)]+)\s*\)',
+        r'CAST(\1 AS DATE)',
+        sql,
+    )
+
+    # NEW_TIME(date, tz1, tz2) -> manual conversion needed
+    sql = re.sub(
+        r'(?i)\bNEW_TIME\s*\([^)]+\)',
+        r'/* NEW_TIME: manual timezone conversion required */',
+        sql,
+    )
+
+    # EXTRACT(YEAR FROM date) is already standard SQL — no change needed
+    # EXTRACT(MONTH FROM date) — same
+
+    return sql
+
+
+def _convert_other_functions(sql: str) -> str:
+    """Convert additional Oracle functions not covered elsewhere."""
+    # NVL2(expr, val_if_not_null, val_if_null) -> CASE WHEN expr IS NOT NULL THEN val_if_not_null ELSE val_if_null END
+    def _replace_nvl2(m: re.Match) -> str:
+        args = _split_function_args(m.group(1))
+        if len(args) >= 3:
+            return f"CASE WHEN {args[0].strip()} IS NOT NULL THEN {args[1].strip()} ELSE {args[2].strip()} END"
+        return m.group(0)
+    sql = re.sub(r'(?i)\bNVL2\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)', _replace_nvl2, sql)
+
+    # GREATEST(a, b, ...) -> MSSQL 2022+ supports GREATEST, otherwise use CASE
+    # For broad compatibility, keep GREATEST (SQL Server 2022+ supports it)
+    # But add a comment for older versions
+    # LEAST -> same (SQL Server 2022+)
+    # We leave these as-is for SQL Server 2022+ compatibility
+
+    # LNNVL(condition) -> condition IS NOT FALSE (or just condition)
+    sql = re.sub(r'(?i)\bLNNVL\s*\(\s*([^)]+)\s*\)', r'\1 IS NOT FALSE', sql)
+
+    # SYS_GUID() -> NEWID()
+    sql = re.sub(r'(?i)\bSYS_GUID\s*\(\s*\)', 'NEWID()', sql)
+
+    # UID -> SYSTEM_USER (already handled in convert_default_value, add here too)
+    sql = re.sub(r'(?i)(?<![.])\bUSER(?![_(])', 'SYSTEM_USER', sql)
+
+    # COALESCE is already standard SQL — no change
+    # NULLIF is already standard SQL — no change
+
+    # SIGN, ABS, CEIL, FLOOR, POWER, SQRT, ROUND, MOD, EXP, LOG, LN
+    # Most are standard. LN -> LOG in MSSQL
+    sql = re.sub(r'(?i)\bLN\s*\(\s*([^)]+)\s*\)', r'LOG(\1)', sql)
+    # MOD(a, b) -> a % b
+    sql = re.sub(r'(?i)\bMOD\s*\(\s*([^,]+?)\s*,\s*([^)]+)\s*\)', r'(\1 % \2)', sql)
+
+    # BITAND(a, b) -> a & b
+    sql = re.sub(r'(?i)\bBITAND\s*\(\s*([^,]+?)\s*,\s*([^)]+)\s*\)', r'(\1 & \2)', sql)
+
+    # SOUNDEX is already standard SQL — no change
+
+    return sql
+
+
+def _convert_string_functions(sql: str) -> str:
+    """Convert Oracle string functions to MSSQL equivalents."""
+    # TO_CHAR(expr) -> CONVERT(VARCHAR, expr) or FORMAT for dates
+    # Already handled partially; handle multi-arg TO_CHAR here
+    # TO_CHAR(date, 'format') -> CONVERT or FORMAT — mark for manual review for complex formats
+    def _replace_to_char(m: re.Match) -> str:
+        args = _split_function_args(m.group(1))
+        if len(args) >= 2:
+            expr = args[0].strip()
+            fmt = args[1].strip()
+            return f"/* TO_CHAR with format: manually convert format {fmt} for {expr} */"
+        return f"CONVERT(VARCHAR, {args[0].strip()})"
+    sql = re.sub(r'(?i)\bTO_CHAR\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)', _replace_to_char, sql)
+
+    # TO_DATE(date_str, 'format') -> CONVERT or CAST — mark complex formats
+    def _replace_to_date(m: re.Match) -> str:
+        args = _split_function_args(m.group(1))
+        if len(args) >= 2:
+            return f"/* TO_DATE with format: manually convert format {args[1].strip()} for {args[0].strip()} */"
+        return f"CONVERT(DATETIME2, {args[0].strip()})"
+    sql = re.sub(r'(?i)\bTO_DATE\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)', _replace_to_date, sql)
+
+    # TO_NUMBER(str) -> CAST(str AS DECIMAL)
+    def _replace_to_number(m: re.Match) -> str:
+        args = _split_function_args(m.group(1))
+        if len(args) >= 2:
+            return f"/* TO_NUMBER with format: manually convert format {args[1].strip()} for {args[0].strip()} */"
+        return f"CAST({args[0].strip()} AS DECIMAL)"
+    sql = re.sub(r'(?i)\bTO_NUMBER\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)', _replace_to_number, sql)
+
+    # LENGTH -> LEN
+    sql = re.sub(r'(?i)\bLENGTH\s*\(\s*([^)]+)\s*\)', r'LEN(\1)', sql)
+
+    # SUBSTR(str, start, length) -> SUBSTRING(str, start, length)
+    # Handle variable-length expressions (not just \w+)
+    sql = re.sub(
+        r'(?i)\bSUBSTR\s*\(\s*([^,]+?)\s*,\s*([^,]+?)\s*,\s*([^)]+)\s*\)',
+        r'SUBSTRING(\1, \2, \3)',
+        sql,
+    )
+
+    # INSTR — already partially handled; add 4-arg version
+    # INSTR(str, substr, start, occurrence) -> complex, mark for review
+    # INSTR(str, substr, start) -> CHARINDEX with custom logic
+    def _replace_instr(m: re.Match) -> str:
+        args = _split_function_args(m.group(1))
+        if len(args) >= 4:
+            return f"/* INSTR with occurrence: manually convert INSTR({', '.join(args)}) */"
+        elif len(args) == 3:
+            return f"CHARINDEX({args[1].strip()}, {args[0].strip()}, {args[2].strip()})"
+        elif len(args) == 2:
+            return f"CHARINDEX({args[1].strip()}, {args[0].strip()})"
+        return m.group(0)
+    sql = re.sub(r'(?i)\bINSTR\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)', _replace_instr, sql)
+
+    # REPLACE is already standard SQL — no change
+    # UPPER, LOWER are standard — no change
+    # INITCAP -> no direct MSSQL equivalent, use custom function
+    sql = re.sub(r'(?i)\bINITCAP\s*\(\s*([^)]+)\s*\)',
+                 r'/* INITCAP: no direct MSSQL equivalent, implement as scalar function */', sql)
+
+    # CONCAT(a, b) -> a + b (or CONCAT which MSSQL also supports)
+    # Keep CONCAT as-is since MSSQL 2012+ supports it
+
+    # TRANSLATE(str, from_str, to_str) -> manual or nested REPLACE
+    sql = re.sub(
+        r'(?i)\bTRANSLATE\s*\(\s*([^,]+?)\s*,\s*([^,]+?)\s*,\s*([^)]+)\s*\)',
+        r'/* TRANSLATE: replace with nested REPLACE or TRANSLATE (SQL Server 2017+) */',
+        sql,
+    )
+
+    return sql
+
+
+def _convert_aggregate_functions(sql: str) -> str:
+    """Convert Oracle aggregate functions to MSSQL equivalents."""
+    # WM_CONCAT -> STRING_AGG(col, ',')
+    sql = re.sub(
+        r'(?i)\bWM_CONCAT\s*\(\s*([^)]+)\s*\)',
+        r"STRING_AGG(\1, ',')",
+        sql,
+    )
+
+    # LISTAGG — already handled in _convert_view_body; add here for procedures
+    sql = re.sub(
+        r'(?i)LISTAGG\s*\(\s*([^,]+?)\s*,\s*([^)]+)\s*\)\s*WITHIN\s*GROUP\s*\(\s*ORDER\s*BY\s+([^)]+)\s*\)',
+        r'STRING_AGG(\1, \2) WITHIN GROUP (ORDER BY \3)',
+        sql,
+    )
+    # LISTAGG without WITHIN GROUP (rare)
+    sql = re.sub(
+        r'(?i)LISTAGG\s*\(\s*([^,]+?)\s*,\s*([^)]+)\s*\)',
+        r"STRING_AGG(\1, \2)",
+        sql,
+    )
+
+    # STDDEV -> STDEV
+    sql = re.sub(r'(?i)\bSTDDEV\s*\(\s*([^)]+)\s*\)', r'STDEV(\1)', sql)
+
+    # VARIANCE -> VAR
+    sql = re.sub(r'(?i)\bVARIANCE\s*\(\s*([^)]+)\s*\)', r'VAR(\1)', sql)
+
+    return sql
+
+
+def _convert_regex_functions(sql: str) -> str:
+    """Convert Oracle REGEXP_* functions. MSSQL has limited support.
+
+    SQL Server 2017+ has STRING_SPLIT and TRANSLATE but no native REGEXP.
+    SQL Server 2022+ has GENERATE_SERIES and enhanced string functions but still
+    no native regex. Mark for manual review or suggest CLR/like alternatives.
+    """
+    # REGEXP_LIKE(expr, pattern) -> LIKE or manual review
+    def _replace_regexp_like(m: re.Match) -> str:
+        args = _split_function_args(m.group(1))
+        if len(args) >= 2:
+            expr = args[0].strip()
+            pattern = args[1].strip()
+            return f"/* REGEXP_LIKE({expr}, {pattern}): manually convert to LIKE or use CLR */"
+        return m.group(0)
+    sql = re.sub(r'(?i)\bREGEXP_LIKE\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)', _replace_regexp_like, sql)
+
+    # REGEXP_SUBSTR(expr, pattern, ...) -> manual review
+    def _replace_regexp_substr(m: re.Match) -> str:
+        args = _split_function_args(m.group(1))
+        return f"/* REGEXP_SUBSTR: manually convert — args: {', '.join(args)} */"
+    sql = re.sub(r'(?i)\bREGEXP_SUBSTR\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)', _replace_regexp_substr, sql)
+
+    # REGEXP_REPLACE(expr, pattern, replacement, ...) -> manual review
+    def _replace_regexp_replace(m: re.Match) -> str:
+        args = _split_function_args(m.group(1))
+        return f"/* REGEXP_REPLACE: manually convert — args: {', '.join(args)} */"
+    sql = re.sub(r'(?i)\bREGEXP_REPLACE\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)', _replace_regexp_replace, sql)
+
+    # REGEXP_INSTR — same treatment
+    def _replace_regexp_instr(m: re.Match) -> str:
+        args = _split_function_args(m.group(1))
+        return f"/* REGEXP_INSTR: manually convert — args: {', '.join(args)} */"
+    sql = re.sub(r'(?i)\bREGEXP_INSTR\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)', _replace_regexp_instr, sql)
+
+    # REGEXP_COUNT — same treatment
+    def _replace_regexp_count(m: re.Match) -> str:
+        args = _split_function_args(m.group(1))
+        return f"/* REGEXP_COUNT: manually convert — args: {', '.join(args)} */"
+    sql = re.sub(r'(?i)\bREGEXP_COUNT\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)', _replace_regexp_count, sql)
+
+    return sql
+
+
+def _convert_dbms_functions(sql: str) -> str:
+    """Convert or mark Oracle DBMS_* package calls for manual review."""
+    # DBMS_OUTPUT.PUT_LINE -> PRINT
+    sql = re.sub(r'(?i)\bDBMS_OUTPUT\.PUT_LINE\s*\(\s*([^)]+)\s*\)', r'PRINT \1', sql)
+
+    # DBMS_RANDOM.VALUE([low, high]) -> RAND() or custom
+    sql = re.sub(
+        r'(?i)\bDBMS_RANDOM\.VALUE\s*\(\s*([^,]+?)\s*,\s*([^)]+)\s*\)',
+        r'/* DBMS_RANDOM.VALUE: use RAND() * (\2 - \1) + \1 */',
+        sql,
+    )
+    sql = re.sub(r'(?i)\bDBMS_RANDOM\.VALUE\s*\(\s*\)', r'RAND()', sql)
+
+    # DBMS_UTILITY.GET_TIME -> manual
+    sql = re.sub(
+        r'(?i)\bDBMS_UTILITY\.GET_TIME\s*\(\s*\)',
+        r'/* DBMS_UTILITY.GET_TIME: use DATEDIFF(millisecond, start_time, GETDATE()) */',
+        sql,
+    )
+
+    # Generic DBMS_* — mark for review
+    sql = re.sub(
+        r'(?i)\bDBMS_\w+\.\w+\s*\(',
+        r'/* MANUAL REVIEW: Oracle DBMS package call — find MSSQL equivalent */',
+        sql,
+    )
+
+    return sql
+
+
+def _convert_all_oracle_functions(sql: str) -> str:
+    """Apply all Oracle function conversions in the correct order.
+
+    This is the single entry point used by all converters.
+    """
+    sql = _convert_decode(sql)
+    sql = _convert_date_functions(sql)
+    sql = _convert_string_functions(sql)
+    sql = _convert_other_functions(sql)
+    sql = _convert_aggregate_functions(sql)
+    sql = _convert_regex_functions(sql)
+    sql = _convert_dbms_functions(sql)
+    return sql
+
+
 def convert_data_type(
     oracle_type: str,
     data_length: int = 0,
@@ -345,16 +733,19 @@ class TableConverter:
         """Convert Oracle check condition to MSSQL-compatible format."""
         if not condition:
             return ""
-        
+
         # Remove outer parentheses if present
         condition = condition.strip()
         if condition.startswith('(') and condition.endswith(')'):
             condition = condition[1:-1]
-        
+
         # Common conversions
         condition = re.sub(r'(?i)\bSYSDATE\b', 'GETDATE()', condition)
         condition = re.sub(r'(?i)\bNVL\s*\(', 'ISNULL(', condition)
-        
+
+        # Apply full Oracle function conversions
+        condition = _convert_all_oracle_functions(condition)
+
         return condition
 
     def _convert_foreign_key(self, table_name: str, fk: ConstraintDef) -> str:
@@ -454,52 +845,37 @@ class ViewConverter:
     def _convert_view_body(self, text: str) -> str:
         """Convert Oracle SQL to MSSQL-compatible SQL."""
         sql = text
-        
+
         # Remove Oracle-specific hints
         sql = re.sub(r'/\*+\([^)]+\)\s*\*/', '', sql)
-        
+
         # Convert ROWNUM to TOP or ROW_NUMBER()
         sql = self._convert_rownum(sql)
-        
+
         # Convert CONNECT BY to recursive CTE
         sql = self._convert_connect_by(sql)
-        
+
         # Convert dual table references
         if self.config.convert_dual_table:
             sql = self._convert_dual(sql)
-        
-        # Convert date functions
+
+        # Convert SYSDATE / SYSTIMESTAMP (before _convert_all_oracle_functions)
         sql = re.sub(r'(?i)\bSYSDATE\b', 'GETDATE()', sql)
         sql = re.sub(r'(?i)\bSYSTIMESTAMP\b', 'SYSDATETIME()', sql)
-        
-        # Convert string functions
+
+        # Convert NVL -> ISNULL (before _convert_all_oracle_functions)
         sql = re.sub(r'(?i)\bNVL\s*\(', 'ISNULL(', sql)
-        sql = re.sub(r'(?i)\bDECODE\s*\(', 'CASE', sql)  # Simplified
-        sql = re.sub(r'(?i)\bTO_CHAR\s*\(', 'CONVERT(VARCHAR, ', sql)
-        sql = re.sub(r'(?i)\bTO_DATE\s*\(', 'CONVERT(DATETIME2, ', sql)
-        sql = re.sub(r'(?i)\bTO_NUMBER\s*\(', 'CAST(', sql)
-        sql = re.sub(r'(?i)\bTRUNC\s*\(', 'CAST(', sql)  # Simplified for dates
-        
-        # Convert LISTAGG to STRING_AGG
-        sql = re.sub(r'(?i)LISTAGG\s*\((\w+)\s*,\s*([^)]+)\)\s*WITHIN\s*GROUP\s*\(\s*ORDER\s*BY\s+([^)]+)\)',
-                     r'STRING_AGG(\1, \2) WITHIN GROUP (ORDER BY \3)', sql)
-        
-        # Convert || to +
+
+        # Apply all Oracle function conversions
+        sql = _convert_all_oracle_functions(sql)
+
+        # Convert || to + (string concatenation)
         sql = sql.replace('||', '+')
-        
-        # Convert SUBSTR to SUBSTRING
-        sql = re.sub(r'(?i)\bSUBSTR\s*\(\s*(\w+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)',
-                     r'SUBSTRING(\1, \2, \3)', sql)
-        
-        # Convert INSTR to CHARINDEX
-        sql = re.sub(r'(?i)\bINSTR\s*\(\s*(\w+)\s*,\s*([^,]+)\s*\)',
-                     r'CHARINDEX(\2, \1)', sql)
 
         # Convert sequence.NEXTVAL to NEXT VALUE FOR
         sql = re.sub(r'(?i)(\w+)\.NEXTVAL', r'NEXT VALUE FOR \1', sql)
 
         # Handle sequence.CURRVAL - MSSQL has no direct equivalent
-        # Add warning comment for manual review
         if re.search(r'(?i)(\w+)\.CURRVAL', sql):
             sql = re.sub(r'(?i)(\w+)\.CURRVAL',
                          r'/* MANUAL: Replace \1.CURRVAL - use SCOPE_IDENTITY() or a variable */', sql)
@@ -549,13 +925,116 @@ class ViewConverter:
         return sql
 
     def _convert_connect_by(self, sql: str) -> str:
-        """Convert CONNECT BY hierarchical queries to recursive CTE."""
-        # This is a simplified conversion - complex hierarchies may need manual adjustment
-        connect_by_match = re.search(r'(?i)CONNECT\s+BY\s+(PRIOR\s+)?(\w+)\s*=\s*(\w+)', sql)
-        if connect_by_match:
-            # Convert to recursive CTE structure
-            return sql  # Return as-is with comment for manual conversion
-        return sql
+        """Convert CONNECT BY hierarchical queries to recursive CTE.
+
+        Handles simple patterns:
+            SELECT ... FROM table
+            [WHERE start_condition]
+            CONNECT BY [NOCYCLE] PRIOR child = parent
+            [ORDER SIBLINGS BY ...]
+
+        Converts to:
+            WITH cte_hierarchy AS (
+                SELECT ... FROM table WHERE start_condition   -- anchor
+                UNION ALL
+                SELECT ... FROM table c JOIN cte_hierarchy p  -- recursive
+                    ON c.child = p.parent
+            )
+            SELECT ... FROM cte_hierarchy
+        """
+        # Pattern: CONNECT BY [NOCYCLE] PRIOR col1 = col2
+        cb_match = re.search(
+            r'(?i)(CONNECT\s+BY\s+(?:NOCYCLE\s+)?(?:PRIOR\s+)?(\w+(?:\.\w+)?)\s*=\s*(?:PRIOR\s+)?(\w+(?:\.\w+)?))',
+            sql,
+        )
+        if not cb_match:
+            # Try without PRIOR keyword
+            cb_match = re.search(
+                r'(?i)(CONNECT\s+BY\s+(?:NOCYCLE\s+)?(\w+(?:\.\w+)?)\s*=\s*(\w+(?:\.\w+)?))',
+                sql,
+            )
+        if not cb_match:
+            return sql
+
+        full_clause = cb_match.group(0)
+        child_col = cb_match.group(2).strip()
+        parent_col = cb_match.group(3).strip()
+
+        is_nocycle = bool(re.search(r'(?i)NOCYCLE', full_clause))
+
+        # Extract the SELECT ... FROM table part before CONNECT BY
+        before_cb = sql[:cb_match.start()]
+        after_cb = sql[cb_match.end():]
+
+        # Remove ORDER SIBLINGS BY (MSSQL ORDER BY is after the final SELECT)
+        siblings_order = ''
+        siblings_match = re.search(r'(?i)\s*ORDER\s+SIBLINGS\s+BY\s+([^;\n]+)', after_cb)
+        if siblings_match:
+            siblings_order = siblings_match.group(1).strip()
+            after_cb = after_cb[:siblings_match.start()] + after_cb[siblings_match.end():]
+
+        # Extract START WITH condition
+        start_match = re.search(r'(?i)\bSTART\s+WITH\s+(.+?)(?=\s+CONNECT\s+BY|$)', before_cb, re.DOTALL)
+        start_condition = start_match.group(1).strip() if start_match else None
+
+        # Remove START WITH from before_cb
+        if start_match:
+            before_cb = before_cb[:start_match.start()] + before_cb[start_match.end():]
+
+        # Remove CONNECT BY clause from before_cb
+        before_cb = before_cb.replace(full_clause, '').strip()
+
+        # Now before_cb should be: SELECT ... FROM table [WHERE ...]
+        # Extract the SELECT list and FROM table
+        select_match = re.search(r'(?i)\bSELECT\s+(DISTINCT\s+)?(.+?)\bFROM\s+(\w+(?:\.\w+)?(?:\s+\w+)?)', before_cb, re.DOTALL)
+        if not select_match:
+            return sql  # Can't parse, return as-is
+
+        distinct = select_match.group(1) or ''
+        select_list = select_match.group(2).strip()
+        from_table = select_match.group(3).strip()
+
+        # Add LEVEL pseudo-column support
+        if 'LEVEL' in select_list.upper():
+            select_list = select_list + ', 1 AS LEVEL'
+
+        # Build the recursive CTE
+        anchor_where = start_condition if start_condition else '1=1'
+        recursive_join = f"t.{child_col} = h.{parent_col}"
+
+        cte = f"WITH cte_hierarchy AS (\n"
+        cte += f"    -- Anchor: root rows\n"
+        cte += f"    SELECT {select_list}\n"
+        cte += f"    FROM {from_table}\n"
+        cte += f"    WHERE {anchor_where}\n"
+        cte += f"    UNION ALL\n"
+        cte += f"    -- Recursive: child rows\n"
+        cte += f"    SELECT t.*\n"
+        cte += f"    FROM {from_table} t\n"
+        cte += f"    INNER JOIN cte_hierarchy h ON {recursive_join}\n"
+        if is_nocycle:
+            cte += f"    WHERE NOT EXISTS (SELECT 1 FROM cte_hierarchy h2 WHERE h2.{child_col} = t.{parent_col})\n"
+        cte += f")\n"
+
+        # Build final SELECT
+        if siblings_order:
+            final_select = f"SELECT {distinct} *\nFROM cte_hierarchy\nORDER BY {siblings_order}"
+        else:
+            remaining = after_cb.strip()
+            # Extract ORDER BY, GROUP BY, etc.
+            order_match = re.search(r'(?i)\bORDER\s+BY\s+(.+?)(?:;|$)', remaining, re.DOTALL)
+            if order_match:
+                order_clause = order_match.group(1).strip().rstrip(';')
+                final_select = f"SELECT {distinct} *\nFROM cte_hierarchy\nORDER BY {order_clause}"
+            else:
+                final_select = f"SELECT {distinct} *\nFROM cte_hierarchy"
+
+        result = cte + final_select
+
+        # Add manual review note
+        result = f"/* CONNECT BY converted to recursive CTE — review for correctness */\n" + result
+
+        return result
 
 
 class SequenceConverter:
@@ -668,41 +1147,42 @@ class ProcedureConverter:
     def _convert_source(self, source: str, args: List[Dict], proc_type: str) -> str:
         """Convert procedure/function source code."""
         sql = source
-        
+
         # Remove Oracle-specific directives
         sql = re.sub(r'(?i)CREATE\s+(OR\s+REPLACE\s+)?', 'CREATE ', sql)
-        
+
         # Convert parameter modes
         sql = re.sub(r'(?i)\bIN\s+OUT\b', 'OUTPUT', sql)
         sql = re.sub(r'(?i)\bOUT\b', 'OUTPUT', sql)
         # Keep IN parameters without keyword (MSSQL default)
-        
+
         # Convert parameter types
         for oracle_type, mssql_type in DEFAULT_TYPE_MAPPINGS.items():
             sql = re.sub(r'(?i)\b' + re.escape(oracle_type) + r'\b', mssql_type, sql)
-        
+
         # Replace VARCHAR2 with NVARCHAR
         sql = re.sub(r'(?i)\bVARCHAR2\b', 'NVARCHAR', sql)
-        
+
         # Convert Oracle string length syntax
         sql = re.sub(r'(?i)\bNVARCHAR\s*\(\s*\d+\s*\bBYTE\b\s*\)', 'NVARCHAR', sql)
         sql = re.sub(r'(?i)\bNVARCHAR\s*\(\s*\d+\s*\bCHAR\b\s*\)', 'NVARCHAR', sql)
-        
+
         # Convert boolean
         sql = re.sub(r'(?i)\bTRUE\b', '1', sql)
         sql = re.sub(r'(?i)\bFALSE\b', '0', sql)
-        
-        # Convert NULL handling
+
+        # Convert SYSDATE/SYSTIMESTAMP (before _convert_all_oracle_functions)
+        sql = re.sub(r'(?i)\bSYSDATE\b', 'GETDATE()', sql)
+        sql = re.sub(r'(?i)\bSYSTIMESTAMP\b', 'SYSDATETIME()', sql)
+
+        # Convert NVL -> ISNULL (before _convert_all_oracle_functions)
         sql = re.sub(r'(?i)\bNVL\s*\(', 'ISNULL(', sql)
-        
+
+        # Apply all Oracle function conversions
+        sql = _convert_all_oracle_functions(sql)
+
         # Convert string concatenation
         sql = sql.replace('||', '+')
-
-        # Convert date functions
-        sql = re.sub(r'(?i)\bSYSDATE\b', 'GETDATE()', sql)
-        sql = re.sub(r'(?i)\bTO_DATE\s*\(', 'CONVERT(DATETIME2, ', sql)
-        sql = re.sub(r'(?i)\bTO_CHAR\s*\(', 'CONVERT(VARCHAR, ', sql)
-        sql = re.sub(r'(?i)\bTO_NUMBER\s*\(', 'CAST(', sql)
 
         # Convert sequence.NEXTVAL to NEXT VALUE FOR (MSSQL 2012+)
         sql = re.sub(r'(?i)(\w+)\.NEXTVAL', r'NEXT VALUE FOR \1', sql)
@@ -722,13 +1202,13 @@ class ProcedureConverter:
             # Add END CATCH and closing END if missing
             if not re.search(r'(?i)END\s*;\s*$', sql):
                 sql = sql.rstrip() + "\nEND CATCH;\nEND"
-        
+
         # Remove PRAGMA statements
         sql = re.sub(r'(?i)PRAGMA\s+.*?;?', '', sql)
-        
+
         # Remove semicolons after END for MSSQL (keep final END;)
         sql = re.sub(r'(?i)(?!END\s*;)\bEND\s*;', 'END', sql)
-        
+
         return sql
 
     def _add_returns_clause(self, source: str, args: List[Dict]) -> str:
@@ -787,37 +1267,36 @@ class TriggerConverter:
     def _convert_source(self, source: str, trigger: TriggerDef) -> str:
         """Convert trigger source code."""
         sql = source
-        
+
         # Convert trigger timing
         sql = re.sub(r'(?i)CREATE\s+(OR\s+REPLACE\s+)?TRIGGER', 'CREATE TRIGGER', sql)
-        
+
         # Convert BEFORE to INSTEAD OF
         sql = re.sub(r'(?i)\bBEFORE\s+(INSERT|UPDATE|DELETE)', r'INSTEAD OF \1', sql)
         sql = re.sub(r'(?i)\bAFTER\s+(INSERT|UPDATE|DELETE)', r'AFTER \1', sql)
-        
+
         # Convert FOR EACH ROW
         sql = re.sub(r'(?i)\bFOR\s+EACH\s+ROW', '', sql)
-        
+
         # Convert :NEW and :OLD references
         sql = re.sub(r':NEW\.', 'INSERTED.', sql)
         sql = re.sub(r':OLD\.', 'DELETED.', sql)
-        
+
         # Convert raising application error
         sql = re.sub(r'(?i)RAISE_APPLICATION_ERROR\s*\(\s*[^,]+,\s*', 'RAISERROR(N', sql)
-        
-        # Convert EXCEPTION block to TRY...CATCH skeleton
-        if re.search(r'(?i)EXCEPTION\s+WHEN\s+OTHERS\s+THEN', sql):
-            sql = re.sub(r'(?i)EXCEPTION\s+WHEN\s+OTHERS\s+THEN', 'END TRY\nBEGIN CATCH', sql)
-            sql = re.sub(r'(?i)(CREATE\s+TRIGGER\s+\w+\s+ON\s+\w+\s+(?:INSTEAD\s+OF|AFTER)\s+\w+\s+AS\s+)', 
-                         r'\1BEGIN TRY\n', sql, count=1, flags=re.IGNORECASE)
-            sql = sql.rstrip() + "\nEND CATCH;\nEND"
-        
+
+        # Convert SYSDATE/SYSTIMESTAMP (before _convert_all_oracle_functions)
+        sql = re.sub(r'(?i)\bSYSDATE\b', 'GETDATE()', sql)
+        sql = re.sub(r'(?i)\bSYSTIMESTAMP\b', 'SYSDATETIME()', sql)
+
+        # Convert NVL -> ISNULL (before _convert_all_oracle_functions)
+        sql = re.sub(r'(?i)\bNVL\s*\(', 'ISNULL(', sql)
+
+        # Apply all Oracle function conversions
+        sql = _convert_all_oracle_functions(sql)
+
         # Convert string concatenation
         sql = sql.replace('||', '+')
-
-        # Convert functions
-        sql = re.sub(r'(?i)\bNVL\s*\(', 'ISNULL(', sql)
-        sql = re.sub(r'(?i)\bSYSDATE\b', 'GETDATE()', sql)
 
         # Convert sequence.NEXTVAL to NEXT VALUE FOR (MSSQL 2012+)
         sql = re.sub(r'(?i)(\w+)\.NEXTVAL', r'NEXT VALUE FOR \1', sql)
@@ -826,6 +1305,13 @@ class TriggerConverter:
         if re.search(r'(?i)(\w+)\.CURRVAL', sql):
             sql = re.sub(r'(?i)(\w+)\.CURRVAL',
                          r'/* MANUAL: Replace \1.CURRVAL with SCOPE_IDENTITY() or stored variable */', sql)
+
+        # Convert EXCEPTION block to TRY...CATCH skeleton
+        if re.search(r'(?i)EXCEPTION\s+WHEN\s+OTHERS\s+THEN', sql):
+            sql = re.sub(r'(?i)EXCEPTION\s+WHEN\s+OTHERS\s+THEN', 'END TRY\nBEGIN CATCH', sql)
+            sql = re.sub(r'(?i)(CREATE\s+TRIGGER\s+\w+\s+ON\s+\w+\s+(?:INSTEAD\s+OF|AFTER)\s+\w+\s+AS\s+)',
+                         r'\1BEGIN TRY\n', sql, count=1, flags=re.IGNORECASE)
+            sql = sql.rstrip() + "\nEND CATCH;\nEND"
 
         return sql
 

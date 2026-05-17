@@ -33,12 +33,14 @@ class OracleConfig:
 
 @dataclass
 class MSSQLConfig:
-    """MSSQL database connection configuration (for output generation)."""
+    """MSSQL database connection configuration."""
     host: str = ""
     port: int = 1433
     database: str = ""
     username: str = ""
     password: str = ""
+    login_timeout: int = 30
+    query_timeout: int = 60
 
 
 @dataclass
@@ -109,7 +111,9 @@ class Config:
                 port=int(mssql_data.get('port', 1433)),
                 database=mssql_data.get('database', ''),
                 username=mssql_data.get('username', ''),
-                password=mssql_data.get('password', '')
+                password=mssql_data.get('password', ''),
+                login_timeout=int(mssql_data.get('login_timeout', 30)),
+                query_timeout=int(mssql_data.get('query_timeout', 60))
             )
         
         if 'conversion' in data:
